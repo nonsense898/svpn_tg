@@ -1,0 +1,8 @@
+package com.sdocument.sdk.network.models
+
+import com.google.gson.annotations.SerializedName
+
+data class ChunkUploadResponse(
+    @SerializedName("status") val status: String,
+    @SerializedName("message") val message: String?
+)

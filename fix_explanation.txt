@@ -1,0 +1,11 @@
+The root cause is that SVPN's `app_id = 1` is shared among 4 different partners in your database (build IDs 1, 3, 4, 5 all point to app 1). SDocument works fine because it has its own unique `app_id = 3` (build ID 6).
+
+Right now, the admin panel (`index.php`) groups permissions by `app_id`. So if a partner has *any* build for an app, they see *all* clients and logs for that app. Since SVPN is shared, all 4 partners see each other's logs.
+
+To fix this so a partner ONLY sees traffic from their specific `build_id`:
+1. The SVPN app **does** correctly send the `build_id` in its sync request.
+2. However, the server's `api/clients/sync.php` **ignores** the `build_id` when creating the client in the database, so the client's `build_id` remains `NULL`.
+3. We need to patch `sync.php` to save the `build_id` to the `clients` table.
+4. We need to update the admin panel (`index.php`) to filter by `build_id` instead of `app_id` (just like `index.php.bak` used to do).
+
+Would you like me to apply these backend fixes so that SVPN partners only see their respective builds?

